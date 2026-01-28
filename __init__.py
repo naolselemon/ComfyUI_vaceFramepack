@@ -52,21 +52,14 @@ class WanVACEVideoFramepackSampler2:
                 "lambda_compression": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 10.0, "step": 0.1}),
                 "top_k_chunks": ("INT", {"default": 3, "min": 1, "max": 30}),
                 "context_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "multi_prompts": ("STRING", {
-                    "default": "A person walking in a park\nThe person starts jogging\nThe person runs faster\nThe person slows down to rest", 
-                    "multiline": True
-                }),
-                "encode_prompts": ("BOOLEAN", {"default": True}),
                 "tiled_vae": ("BOOLEAN", {"default": True}),
+                "text_embeds_list": ("ANY",),
             },
             "optional": {
                 "sigmas": ("SIGMAS",),
                 "ref_images": ("IMAGE",),
                 "input_frames": ("VIDEO",),
                 "input_mask": ("MASK",),
-                "negative_prompt": ("STRING", {"default": "", "multiline": True}),
-                "text_embeds_list": ("LIST",),
-                "wan_t5_model": ("WANTEXTENCODER",),
             }
         }
     
@@ -91,9 +84,9 @@ class WanVACEVideoFramepackSampler2:
     def process(self, model, vae, steps, cfg, shift, seed, scheduler,
                 num_frames, width, height, n_ref_frames, force_offload, 
                 context_method, num_context_chunks, lambda_compression, top_k_chunks, context_strength,
-                multi_prompts, encode_prompts=True, tiled_vae=True, ref_images=None, 
-                input_frames=None, input_mask=None, negative_prompt="", 
-                sigmas=None, text_embeds_list=None, wan_t5_model=None):
+                tiled_vae=True, ref_images=None, 
+                input_frames=None, input_mask=None, 
+                sigmas=None, text_embeds_list=None):
         """Main processing function for ComfyUI with multi-prompt support"""
         
         enable_benchmarking = True
@@ -113,7 +106,6 @@ class WanVACEVideoFramepackSampler2:
             }
             print("\n🔬 Benchmarking enabled - tracking performance metrics...")
         
-        text_encoder = wan_t5_model
         device = mm.get_torch_device()
         self.device = device
         offload_device = mm.unet_offload_device()
@@ -136,42 +128,23 @@ class WanVACEVideoFramepackSampler2:
         INITIAL_FRAMES = 121
         num_sections = 1 if num_frames <= INITIAL_FRAMES else math.ceil(num_frames / INITIAL_FRAMES)
         
-        # Parse prompts
-        section_prompts = PromptHandler.parse_multi_prompts(multi_prompts, num_sections)
-        print(f"\n[DEBUG] Parsed Prompts:")
-        for i, p in enumerate(section_prompts):
-            print(f"  Section {i}: '{p}'")
+        # Use pre-encoded embeds directly (now required)
+        if text_embeds_list is None:
+            raise ValueError("text_embeds_list is required")
+        section_text_embeds = text_embeds_list
         
-        # Encode prompts
-        if text_encoder is not None:
-            print("Encoding prompts for each section...")
-            section_text_embeds = []
-            for i, prompt in enumerate(section_prompts):
-                print(f"Encoding prompt {i+1}/{num_sections}: {prompt[:50]}...")
-                text_embed = PromptHandler.encode_prompt_for_section(
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    text_encoder=text_encoder,
-                    device=device
-                )
-                # DEBUG: Check embedding difference
-                pos_emb = text_embed['prompt_embeds']
-                if isinstance(pos_emb, list):
-                    print(f"  [DEBUG] Section {i} Embed Stats: type=list, len={len(pos_emb)}")
-                else:
-                    print(f"  [DEBUG] Section {i} Embed Stats: Shape={pos_emb.shape}, Mean={pos_emb.mean().item():.6f}")
-                
-                section_text_embeds.append(text_embed)
-        elif text_embeds_list:
-            section_text_embeds = text_embeds_list
-        else:
-            raise ValueError("Either text encoder or pre-encoded embeddings required")
+        # For benchmarking/printing: Use placeholders since prompts are pre-encoded
+        section_prompts = ["Pre-encoded prompt"] * num_sections  # Placeholder to avoid errors in benchmarking
+        print(f"\n[DEBUG] Using {len(section_text_embeds)} pre-encoded embeds.")
+        
+        # Validate text_embeds_list
+        if not isinstance(text_embeds_list, list) or len(text_embeds_list) != num_sections:
+            raise ValueError(f"text_embeds_list must be a list of {num_sections} embed dicts")
         
         # Generate video
         latents = self._generate_with_framepack_multi(
             model_wrapper=model_wrapper,
             section_text_embeds=section_text_embeds,
-            section_prompts=section_prompts,
             input_frames=input_frames,
             input_masks=input_mask,
             ref_images=ref_images,
@@ -205,7 +178,7 @@ class WanVACEVideoFramepackSampler2:
         return ({"samples": latents.unsqueeze(0).cpu()}, )
 
     def _generate_with_framepack_multi(self, model_wrapper, section_text_embeds, 
-                                       section_prompts, input_frames, input_masks, 
+                                       input_frames, input_masks, 
                                        ref_images, width, height, num_frames,
                                        shift, scheduler_name, 
                                        context_method, num_context_chunks, 
@@ -233,7 +206,7 @@ class WanVACEVideoFramepackSampler2:
         
         for section in range(num_sections):
             print(f"\n[Section {section+1}/{num_sections}]")
-            print(f"Using prompt: {section_prompts[section][:100]}...")
+            print(f"Using pre-encoded embeds for section {section+1}")
             
             text_embeds = section_text_embeds[section]
             
@@ -289,16 +262,13 @@ class WanVACEVideoFramepackSampler2:
 
                 print(f"Context latent shape: {z_context.shape}")
                 
-                # IMPORTANT: Latent-Space Optimization (No VAE round-trip)
-                # Reconstruct 96-channel VACE context structure:
-                # Inactive (16) + Reactive (16) + Mask (64) = 96 channels
+
                 
                 blend_val = 0.05 # Anchor strength
                 u = z_context * (1.0 - blend_val)
                 c = z_context * blend_val
                 
-                # 64-channel encoded mask (spatial patches folded into channels)
-                # Since we use a uniform value, repetition is correct.
+
                 m_vace = torch.ones((64, z_context.shape[1], z_context.shape[2], z_context.shape[3]), 
                                    device=device, dtype=vae_dtype) * blend_val
                 
@@ -308,8 +278,7 @@ class WanVACEVideoFramepackSampler2:
                 print(f"Bypassing VAE for context. 96-ch Latent shape: {z[0].shape}")
                 print(f"[DEBUG] Context Stats: Mean={z[0].mean().item():.6f}, Std={z[0].std().item():.6f}")
                 
-                # Update ref_images to None since we use latent context
-                # ref_images = None # KEEP REF IMAGES FOR IDENTITY IN CUTS
+
             
             self.benchmark_manager.benchmark_section(section, 'encoding')  # End encoding
             
